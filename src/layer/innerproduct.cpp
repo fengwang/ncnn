@@ -132,6 +132,44 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
         return 0;
     }
 
+    if (bottom_blob.dims == 3 && w == num_input)
+    {
+        top_blob.create(num_output, h, channels, elemsize, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < channels; q++)
+        {
+            const Mat m = bottom_blob.channel(q);
+            Mat outm = top_blob.channel(q);
+
+            for (int j = 0; j < h; j++)
+            {
+                const float* rowptr = m.row(j);
+                float* outptr = outm.row(j);
+
+                for (int p = 0; p < num_output; p++)
+                {
+                    const float* kptr = (const float*)weight_data + w * p;
+
+                    float sum = 0.f;
+                    if (bias_term)
+                        sum = bias_data[p];
+
+                    for (int i = 0; i < w; i++)
+                    {
+                        sum += rowptr[i] * kptr[i];
+                    }
+
+                    outptr[p] = activation_ss(sum, activation_type, activation_params);
+                }
+            }
+        }
+
+        return 0;
+    }
+
     top_blob.create(num_output, elemsize, opt.blob_allocator);
     if (top_blob.empty())
         return -100;

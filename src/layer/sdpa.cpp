@@ -40,6 +40,119 @@ int SDPA::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_bl
     const Mat& past_key = kv_cache ? bottom_blobs[attn_mask ? 4 : 3] : Mat();
     const Mat& past_value = kv_cache ? bottom_blobs[attn_mask ? 5 : 4] : Mat();
 
+    if (query.dims == 4 && !kv_cache)
+    {
+        const int embed_dim = query.w;
+        const int src_seqlen = query.h;
+        const int num_heads = query.d;
+        const int batch_size = query.c;
+        const int cur_seqlen = cur_key.h;
+        const int num_group = cur_key.d;
+        const int out_embed_dim = cur_value.w;
+        const int dst_seqlen = cur_seqlen;
+        const float _scale = scale == 0.f ? 1.f / sqrt(embed_dim) : scale;
+        const int num_heads_per_group = num_heads / num_group;
+
+        Mat& top_blob = top_blobs[0];
+        top_blob.create(out_embed_dim, src_seqlen, num_heads, batch_size, 4u, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        Mat qk_cross(dst_seqlen, src_seqlen, opt.num_threads, 4u, opt.workspace_allocator);
+        if (qk_cross.empty())
+            return -100;
+
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int bq = 0; bq < batch_size * num_heads; bq++)
+        {
+            const int b = bq / num_heads;
+            const int q = bq % num_heads;
+
+            const Mat query_head = query.channel(b).depth(q);
+            const Mat key_head = cur_key.channel(b).depth(q / num_heads_per_group);
+            const Mat value_head = cur_value.channel(b).depth(q / num_heads_per_group);
+            Mat qk_cross_head = qk_cross.channel(get_omp_thread_num());
+            Mat top_blob_head = top_blob.channel(b).depth(q);
+
+            for (int i = 0; i < src_seqlen; i++)
+            {
+                const float* qptr = query_head.row(i);
+                float* outptr = qk_cross_head.row(i);
+
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    const float* kptr = key_head.row(j);
+
+                    float sum = 0.f;
+                    for (int k = 0; k < embed_dim; k++)
+                    {
+                        sum += qptr[k] * kptr[k];
+                    }
+
+                    outptr[j] = sum * _scale;
+                }
+            }
+
+            if (attn_mask)
+            {
+                const Mat& maskm = attn_mask_blob.c > 1 ? attn_mask_blob.channel(q) : attn_mask_blob;
+
+                for (int i = 0; i < src_seqlen; i++)
+                {
+                    const float* mptr = maskm.row(i);
+                    float* outptr = qk_cross_head.row(i);
+
+                    for (int j = 0; j < dst_seqlen; j++)
+                    {
+                        outptr[j] += mptr[j];
+                    }
+                }
+            }
+
+            for (int i = 0; i < src_seqlen; i++)
+            {
+                float* ptr = qk_cross_head.row(i);
+
+                float max = -FLT_MAX;
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    max = std::max(max, ptr[j]);
+                }
+
+                float sum = 0.f;
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    ptr[j] = (float)expf(ptr[j] - max);
+                    sum += ptr[j];
+                }
+
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    ptr[j] /= sum;
+                }
+            }
+
+            for (int i = 0; i < src_seqlen; i++)
+            {
+                const float* qkptr = qk_cross_head.row(i);
+                float* outptr = top_blob_head.row(i);
+
+                for (int j = 0; j < out_embed_dim; j++)
+                {
+                    float sum = 0.f;
+                    for (int k = 0; k < dst_seqlen; k++)
+                    {
+                        sum += qkptr[k] * value_head.row(k)[j];
+                    }
+
+                    outptr[j] = sum;
+                }
+            }
+        }
+
+        return 0;
+    }
+
     const int embed_dim = query.w;
     const int src_seqlen = query.h;
     const int num_heads = query.c;

@@ -300,8 +300,226 @@ int MultiHeadAttention_arm::destroy_pipeline(const Option& _opt)
     return 0;
 }
 
+int MultiHeadAttention_arm::forward_window_batch1_arm(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& _opt) const
+{
+    int q_blob_i = 0;
+    int k_blob_i = 0;
+    int v_blob_i = 0;
+    int attn_mask_i = 0;
+    int cached_xk_i = 0;
+    int cached_xv_i = 0;
+    resolve_bottom_blob_index((int)bottom_blobs.size(), q_blob_i, k_blob_i, v_blob_i, attn_mask_i, cached_xk_i, cached_xv_i);
+
+    const Mat& q_blob = bottom_blobs[q_blob_i];
+    const Mat& k_blob = bottom_blobs[k_blob_i];
+    const Mat& v_blob = bottom_blobs[v_blob_i];
+    const Mat& attn_mask_blob = attn_mask ? bottom_blobs[attn_mask_i] : Mat();
+
+    if (kv_cache)
+        return -1;
+
+    Option opt = _opt;
+    opt.use_fp16_storage &= support_fp16_storage;
+    opt.use_bf16_storage &= support_bf16_storage;
+    opt.use_packing_layout = false;
+
+    Mat q_blob_unpacked;
+    if (q_blob.elempack != 1)
+    {
+        convert_packing(q_blob, q_blob_unpacked, 1, opt);
+        if (q_blob_unpacked.empty())
+            return -100;
+    }
+    else
+    {
+        q_blob_unpacked = q_blob;
+    }
+
+    Mat k_blob_unpacked;
+    if (k_blob.elempack != 1)
+    {
+        convert_packing(k_blob, k_blob_unpacked, 1, opt);
+        if (k_blob_unpacked.empty())
+            return -100;
+    }
+    else
+    {
+        k_blob_unpacked = k_blob;
+    }
+
+    Mat v_blob_unpacked;
+    if (v_blob.elempack != 1)
+    {
+        convert_packing(v_blob, v_blob_unpacked, 1, opt);
+        if (v_blob_unpacked.empty())
+            return -100;
+    }
+    else
+    {
+        v_blob_unpacked = v_blob;
+    }
+
+    Mat attn_mask_blob_unpacked;
+    if (attn_mask && attn_mask_blob.elempack != 1)
+    {
+        convert_packing(attn_mask_blob, attn_mask_blob_unpacked, 1, opt);
+        if (attn_mask_blob_unpacked.empty())
+            return -100;
+    }
+    else
+    {
+        attn_mask_blob_unpacked = attn_mask_blob;
+    }
+
+    if (!supports_window_batch1_inputs(q_blob_unpacked, k_blob_unpacked, v_blob_unpacked))
+        return -1;
+
+    const int embed_dim_per_head = embed_dim / num_heads;
+    const int src_seqlen = q_blob_unpacked.h;
+    const int dst_seqlen = k_blob_unpacked.h;
+    const int num_windows = q_blob_unpacked.c;
+    const int qdim = weight_data_size / embed_dim;
+
+    Mat& top_blob = top_blobs[0];
+    top_blob.create(qdim, src_seqlen, num_windows, 4u, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
+
+    std::vector<int> rets(num_windows, 0);
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int window_index = 0; window_index < num_windows; window_index++)
+    {
+        Option inner_opt = opt;
+        inner_opt.num_threads = 1;
+
+        const Mat q_window = q_blob_unpacked.channel(window_index);
+        const Mat k_window = k_blob_unpacked.channel(window_index);
+        const Mat v_window = v_blob_unpacked.channel(window_index);
+
+        Mat q_affine;
+        int retq = q_gemm->forward(q_window, q_affine, inner_opt);
+        if (retq != 0)
+        {
+            rets[window_index] = retq;
+            continue;
+        }
+
+        Mat k_affine;
+        int retk = k_gemm->forward(k_window, k_affine, inner_opt);
+        if (retk != 0)
+        {
+            rets[window_index] = retk;
+            continue;
+        }
+
+        Mat qk_cross(dst_seqlen, src_seqlen * num_heads, 4u, opt.blob_allocator);
+        if (qk_cross.empty())
+        {
+            rets[window_index] = -100;
+            continue;
+        }
+
+        std::vector<int> retqks(num_heads);
+        for (int i = 0; i < num_heads; i++)
+        {
+            std::vector<Mat> qk_bottom_blobs(2);
+            qk_bottom_blobs[0] = q_affine.row_range(i * embed_dim_per_head, embed_dim_per_head);
+            qk_bottom_blobs[1] = k_affine.row_range(i * embed_dim_per_head, embed_dim_per_head);
+            if (attn_mask)
+            {
+                const Mat& maskm = attn_mask_blob_unpacked.dims == 3 ? attn_mask_blob_unpacked.channel(i) : attn_mask_blob_unpacked;
+                qk_bottom_blobs.push_back(maskm);
+            }
+            std::vector<Mat> qk_top_blobs(1);
+            qk_top_blobs[0] = qk_cross.row_range(i * src_seqlen, src_seqlen);
+            retqks[i] = qk_gemm->forward(qk_bottom_blobs, qk_top_blobs, inner_opt);
+        }
+        for (int i = 0; i < num_heads; i++)
+        {
+            if (retqks[i] != 0)
+            {
+                rets[window_index] = retqks[i];
+                break;
+            }
+        }
+        if (rets[window_index] != 0)
+            continue;
+
+        int retqk = qk_softmax->forward_inplace(qk_cross, inner_opt);
+        if (retqk != 0)
+        {
+            rets[window_index] = retqk;
+            continue;
+        }
+
+        Mat v_affine;
+        int retv = v_gemm->forward(v_window, v_affine, inner_opt);
+        if (retv != 0)
+        {
+            rets[window_index] = retv;
+            continue;
+        }
+
+        Mat qkv_cross(src_seqlen, embed_dim_per_head * num_heads, 4u, opt.blob_allocator);
+        if (qkv_cross.empty())
+        {
+            rets[window_index] = -100;
+            continue;
+        }
+
+        std::vector<int> retqkvs(num_heads);
+        for (int i = 0; i < num_heads; i++)
+        {
+            std::vector<Mat> qkv_bottom_blobs(2);
+            qkv_bottom_blobs[0] = qk_cross.row_range(i * src_seqlen, src_seqlen);
+            qkv_bottom_blobs[1] = v_affine.row_range(i * embed_dim_per_head, embed_dim_per_head);
+            std::vector<Mat> qkv_top_blobs(1);
+            qkv_top_blobs[0] = qkv_cross.row_range(i * embed_dim_per_head, embed_dim_per_head);
+            retqkvs[i] = qkv_gemm->forward(qkv_bottom_blobs, qkv_top_blobs, inner_opt);
+        }
+        for (int i = 0; i < num_heads; i++)
+        {
+            if (retqkvs[i] != 0)
+            {
+                rets[window_index] = retqkvs[i];
+                break;
+            }
+        }
+        if (rets[window_index] != 0)
+            continue;
+
+        Mat out_window;
+        int reto = o_gemm->forward(qkv_cross, out_window, inner_opt);
+        if (reto != 0)
+        {
+            rets[window_index] = reto;
+            continue;
+        }
+
+        Mat top_window = top_blob.channel(window_index);
+        for (int i = 0; i < src_seqlen; i++)
+        {
+            memcpy(top_window.row(i), out_window.row(i), qdim * sizeof(float));
+        }
+    }
+
+    for (int i = 0; i < num_windows; i++)
+    {
+        if (rets[i] != 0)
+            return rets[i];
+    }
+
+    return 0;
+}
+
 int MultiHeadAttention_arm::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& _opt) const
 {
+    if (window_batch1)
+    {
+        return forward_window_batch1_arm(bottom_blobs, top_blobs, _opt);
+    }
+
     int q_blob_i = 0;
     int k_blob_i = 0;
     int v_blob_i = 0;

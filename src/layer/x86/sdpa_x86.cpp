@@ -133,6 +133,11 @@ int SDPA_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& to
     }
 
     const Mat& query = bottom_blobs[0];
+    if (query.dims == 4)
+    {
+        return SDPA::forward(bottom_blobs, top_blobs, opt);
+    }
+
     const Mat& cur_key = bottom_blobs[1];
     const Mat& cur_value = bottom_blobs[2];
     const Mat& attn_mask_blob = attn_mask ? bottom_blobs[3] : Mat();

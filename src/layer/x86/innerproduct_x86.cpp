@@ -105,6 +105,28 @@ int InnerProduct_x86::forward(const Mat& bottom_blob, Mat& top_blob, const Optio
 
     const int num_input = weight_data_size / num_output;
 
+    if (bottom_blob.dims == 3 && bottom_blob.w == num_input)
+    {
+        int h = bottom_blob.h;
+        int channels = bottom_blob.c;
+        size_t elemsize = bottom_blob.elemsize;
+        int elempack = bottom_blob.elempack;
+
+        top_blob.create(num_output, h, channels, elemsize, elempack, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < channels; q++)
+        {
+            const Mat bottom_blob_channel = bottom_blob.channel(q);
+            Mat top_blob_channel = top_blob.channel(q);
+            innerproduct_gemm_sse(bottom_blob_channel, top_blob_channel, weight_data_tm, bias_data, activation_type, activation_params, opt);
+        }
+
+        return 0;
+    }
+
     if (bottom_blob.dims == 2 && bottom_blob.w == num_input)
     {
         // gemm

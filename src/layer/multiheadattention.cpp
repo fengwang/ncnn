@@ -9,6 +9,7 @@ namespace ncnn {
 
 MultiHeadAttention::MultiHeadAttention()
 {
+    window_batch1 = 0;
 }
 
 int MultiHeadAttention::load_param(const ParamDict& pd)
@@ -22,6 +23,7 @@ int MultiHeadAttention::load_param(const ParamDict& pd)
     scale = pd.get(6, 1.f / sqrtf(embed_dim / num_heads));
     kv_cache = pd.get(7, 0);
     int8_scale_term = pd.get(18, 0);
+    window_batch1 = pd.get(19, 0);
 
     return 0;
 }
@@ -78,6 +80,15 @@ int MultiHeadAttention::load_model(const ModelBin& mb)
 // refers to https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html
 int MultiHeadAttention::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
 {
+    if (window_batch1)
+    {
+#if NCNN_INT8
+        if (int8_scale_term)
+            return -1;
+#endif
+        return forward_window_batch1(bottom_blobs, top_blobs, opt);
+    }
+
 #if NCNN_INT8
     if (int8_scale_term)
     {
@@ -368,6 +379,284 @@ int MultiHeadAttention::forward(const std::vector<Mat>& bottom_blobs, std::vecto
         // assert top_blobs.size() == 3
         top_blobs[1] = k_affine;
         top_blobs[2] = v_affine;
+    }
+
+    return 0;
+}
+
+bool MultiHeadAttention::supports_window_batch1_inputs(const Mat& q_blob, const Mat& k_blob, const Mat& v_blob) const
+{
+    if (!window_batch1 || kv_cache)
+        return false;
+
+    if (q_blob.dims != 3 || k_blob.dims != 3 || v_blob.dims != 3)
+        return false;
+
+    if (q_blob.elempack != 1 || k_blob.elempack != 1 || v_blob.elempack != 1)
+        return false;
+
+    if (q_blob.c != k_blob.c || q_blob.c != v_blob.c)
+        return false;
+
+    if (k_blob.h != v_blob.h)
+        return false;
+
+    return weight_data_size % embed_dim == 0;
+}
+
+int MultiHeadAttention::forward_window_batch1(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
+{
+    int q_blob_i = 0;
+    int k_blob_i = 0;
+    int v_blob_i = 0;
+    int attn_mask_i = 0;
+    int cached_xk_i = 0;
+    int cached_xv_i = 0;
+    resolve_bottom_blob_index((int)bottom_blobs.size(), q_blob_i, k_blob_i, v_blob_i, attn_mask_i, cached_xk_i, cached_xv_i);
+
+    const Mat& q_blob = bottom_blobs[q_blob_i];
+    const Mat& k_blob = bottom_blobs[k_blob_i];
+    const Mat& v_blob = bottom_blobs[v_blob_i];
+    const Mat& attn_mask_blob = attn_mask ? bottom_blobs[attn_mask_i] : Mat();
+
+    if (!supports_window_batch1_inputs(q_blob, k_blob, v_blob))
+        return -1;
+
+    if (attn_mask && attn_mask_blob.dims != 2 && attn_mask_blob.dims != 3)
+        return -1;
+
+    const int src_seqlen = q_blob.h;
+    const int dst_seqlen = k_blob.h;
+    const int num_windows = q_blob.c;
+    const int embed_dim_per_head = embed_dim / num_heads;
+    const int qdim = weight_data_size / embed_dim;
+
+    Mat& top_blob = top_blobs[0];
+    top_blob.create(qdim, src_seqlen, num_windows, 4u, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
+
+    std::vector<int> rets(num_windows, 0);
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int window_index = 0; window_index < num_windows; window_index++)
+    {
+        const Mat q_window = q_blob.channel(window_index);
+        const Mat k_window = k_blob.channel(window_index);
+        const Mat v_window = v_blob.channel(window_index);
+
+        Mat q_affine;
+        q_affine.create(src_seqlen, embed_dim, 4u, opt.workspace_allocator);
+        if (q_affine.empty())
+        {
+            rets[window_index] = -100;
+            continue;
+        }
+
+        for (int i = 0; i < src_seqlen; i++)
+        {
+            const float* q_weight_ptr = (const float*)q_weight_data;
+            const float* inptr = q_window.row(i);
+
+            for (int j = 0; j < embed_dim; j++)
+            {
+                const float* ptr = inptr;
+                float sum = q_bias_data[j];
+                for (int k = 0; k < qdim; k++)
+                {
+                    sum += *ptr++ * *q_weight_ptr++;
+                }
+
+                q_affine.row(j)[i] = sum * scale;
+            }
+        }
+
+        Mat k_affine;
+        k_affine.create(dst_seqlen, embed_dim, 4u, opt.workspace_allocator);
+        if (k_affine.empty())
+        {
+            rets[window_index] = -100;
+            continue;
+        }
+
+        for (int i = 0; i < dst_seqlen; i++)
+        {
+            const float* k_weight_ptr = (const float*)k_weight_data;
+            const float* inptr = k_window.row(i);
+
+            for (int j = 0; j < embed_dim; j++)
+            {
+                const float* ptr = inptr;
+                float sum = k_bias_data[j];
+                for (int k = 0; k < kdim; k++)
+                {
+                    sum += *ptr++ * *k_weight_ptr++;
+                }
+
+                k_affine.row(j)[i] = sum;
+            }
+        }
+
+        Mat v_affine;
+        v_affine.create(dst_seqlen, embed_dim, 4u, opt.workspace_allocator);
+        if (v_affine.empty())
+        {
+            rets[window_index] = -100;
+            continue;
+        }
+
+        for (int i = 0; i < dst_seqlen; i++)
+        {
+            const float* v_weight_ptr = (const float*)v_weight_data;
+            const float* inptr = v_window.row(i);
+
+            for (int j = 0; j < embed_dim; j++)
+            {
+                const float* ptr = inptr;
+                float sum = v_bias_data[j];
+                for (int k = 0; k < vdim; k++)
+                {
+                    sum += *ptr++ * *v_weight_ptr++;
+                }
+
+                v_affine.row(j)[i] = sum;
+            }
+        }
+
+        Mat qk_cross;
+        qk_cross.create(dst_seqlen, src_seqlen, num_heads, 4u, opt.workspace_allocator);
+        if (qk_cross.empty())
+        {
+            rets[window_index] = -100;
+            continue;
+        }
+
+        for (int head_index = 0; head_index < num_heads; head_index++)
+        {
+            const Mat q_affine_head = q_affine.row_range(head_index * embed_dim_per_head, embed_dim_per_head);
+            const Mat k_affine_head = k_affine.row_range(head_index * embed_dim_per_head, embed_dim_per_head);
+            Mat qk_cross_head = qk_cross.channel(head_index);
+
+            for (int i = 0; i < src_seqlen; i++)
+            {
+                float* outptr = qk_cross_head.row(i);
+
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    float sum = 0.f;
+                    for (int l = 0; l < embed_dim_per_head; l++)
+                    {
+                        sum += q_affine_head.row(l)[i] * k_affine_head.row(l)[j];
+                    }
+
+                    outptr[j] = sum;
+                }
+            }
+        }
+
+        if (attn_mask)
+        {
+            for (int head_index = 0; head_index < num_heads; head_index++)
+            {
+                const Mat& maskm = attn_mask_blob.dims == 3 ? attn_mask_blob.channel(head_index) : attn_mask_blob;
+                Mat qk_cross_head = qk_cross.channel(head_index);
+
+                for (int i = 0; i < src_seqlen; i++)
+                {
+                    const float* mptr = maskm.row(i);
+                    float* outptr = qk_cross_head.row(i);
+
+                    for (int j = 0; j < dst_seqlen; j++)
+                    {
+                        outptr[j] += mptr[j];
+                    }
+                }
+            }
+        }
+
+        for (int head_index = 0; head_index < num_heads; head_index++)
+        {
+            Mat qk_cross_head = qk_cross.channel(head_index);
+
+            for (int i = 0; i < src_seqlen; i++)
+            {
+                float* ptr = qk_cross_head.row(i);
+
+                float max = -FLT_MAX;
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    max = std::max(max, ptr[j]);
+                }
+
+                float sum = 0.f;
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    ptr[j] = (float)expf(ptr[j] - max);
+                    sum += ptr[j];
+                }
+
+                for (int j = 0; j < dst_seqlen; j++)
+                {
+                    ptr[j] /= sum;
+                }
+            }
+        }
+
+        Mat qkv_cross;
+        qkv_cross.create(src_seqlen, embed_dim, 4u, opt.workspace_allocator);
+        if (qkv_cross.empty())
+        {
+            rets[window_index] = -100;
+            continue;
+        }
+
+        for (int head_index = 0; head_index < num_heads; head_index++)
+        {
+            const Mat qk_cross_head = qk_cross.channel(head_index);
+            const Mat v_affine_head = v_affine.row_range(head_index * embed_dim_per_head, embed_dim_per_head);
+            Mat qkv_cross_head = qkv_cross.row_range(head_index * embed_dim_per_head, embed_dim_per_head);
+
+            for (int i = 0; i < src_seqlen; i++)
+            {
+                for (int j = 0; j < embed_dim_per_head; j++)
+                {
+                    const float* qkptr = qk_cross_head.row(i);
+                    const float* vptr = v_affine_head.row(j);
+
+                    float sum = 0.f;
+                    for (int k = 0; k < dst_seqlen; k++)
+                    {
+                        sum += *qkptr++ * *vptr++;
+                    }
+
+                    qkv_cross_head.row(j)[i] = sum;
+                }
+            }
+        }
+
+        Mat top_window = top_blob.channel(window_index);
+        for (int i = 0; i < src_seqlen; i++)
+        {
+            const float* out_weight_ptr = (const float*)out_weight_data;
+            float* outptr = top_window.row(i);
+
+            for (int j = 0; j < qdim; j++)
+            {
+                float sum = out_bias_data[j];
+                for (int k = 0; k < embed_dim; k++)
+                {
+                    sum += qkv_cross.row(k)[i] * *out_weight_ptr++;
+                }
+
+                outptr[j] = sum;
+            }
+        }
+    }
+
+    for (int i = 0; i < num_windows; i++)
+    {
+        if (rets[i] != 0)
+            return rets[i];
     }
 
     return 0;
