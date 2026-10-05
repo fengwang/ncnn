@@ -190,3 +190,10 @@ ncnn_add_layer_test(UnaryOp)
 ncnn_add_layer_test(Unfold)
 ncnn_add_layer_test(YoloDetectionOutput)
 ncnn_add_layer_test(Yolov3DetectionOutput)
+
+# ncnn2int8 must leave MultiHeadAttention unquantized
+if(NCNN_BUILD_TOOLS AND NCNN_INT8)
+    if(TARGET ncnn2int8)
+        add_test(NAME test_ncnn2int8_mha_skip COMMAND ${CMAKE_COMMAND} -DNCNN2INT8=$<TARGET_FILE:ncnn2int8> -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_ncnn2int8_mha_skip -P ${CMAKE_CURRENT_SOURCE_DIR}/test_ncnn2int8_mha_skip.cmake)
+    endif()
+endif()
