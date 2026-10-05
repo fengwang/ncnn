@@ -18,7 +18,15 @@ public:
 
     virtual int forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
 
+protected:
+#if NCNN_WEIGHT_QUANT
+    int create_pipeline_wq_int8(const Option& opt);
+#endif
+
 private:
+    // the normal 2-D forward path, without the window_batch1 dispatch
+    int forward_impl(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
+    // window_batch1 wrapper, runs forward_impl once per window
     int forward_window_batch1_x86(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
 
 public:

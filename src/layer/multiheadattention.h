@@ -24,6 +24,16 @@ protected:
     int forward_window_batch1(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
     bool supports_window_batch1_inputs(const Mat& q_blob, const Mat& k_blob, const Mat& v_blob) const;
 
+    static int kvcache_capacity(int current_capacity, int new_seqlen, int max_seqlen_hint);
+
+    int create_or_grow_kvcache(const Mat& cache, Mat& new_cache, int new_seqlen, int num_kv_head, int head_dim, size_t elemsize, int elempack, const Option& opt) const;
+
+    int get_weight_block_quantize_params(int& weight_bits, int& block_size, bool& has_input_scale) const;
+
+#if NCNN_WEIGHT_QUANT
+    int forward_weight_block_quantize(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
+#endif
+
 #if NCNN_INT8
     int forward_int8(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
 #endif
@@ -39,7 +49,12 @@ public:
     int kv_cache;
     int window_batch1;
 
-    int int8_scale_term;
+    union
+    {
+        int quantize_term;
+        int int8_scale_term;
+    };
+    int weight_block_quantize;
 
     Mat q_weight_data;
     Mat q_bias_data;
@@ -55,6 +70,17 @@ public:
     Mat k_weight_data_int8_scales;
     Mat v_weight_data_int8_scales;
     float out_weight_data_int8_scale;
+#endif
+
+#if NCNN_WEIGHT_QUANT
+    Mat q_weight_data_quantize_scales;
+    Mat k_weight_data_quantize_scales;
+    Mat v_weight_data_quantize_scales;
+    Mat out_weight_data_quantize_scales;
+    Mat q_weight_data_input_scales;
+    Mat k_weight_data_input_scales;
+    Mat v_weight_data_input_scales;
+    Mat out_weight_data_input_scales;
 #endif
 };
 
