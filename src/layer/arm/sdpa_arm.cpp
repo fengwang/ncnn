@@ -143,7 +143,7 @@ int SDPA_arm::destroy_pipeline(const Option& _opt)
 }
 
 // unpack to elempack 1 and cast to fp32 for the naive 4-D reference path
-static int sdpa_4d_blob_to_fp32(const Mat& src, Mat& dst, bool fp16, const Option& opt)
+static int sdpa_4d_blob_to_fp32(const Mat& src, Mat& dst, const Option& opt)
 {
     if (src.empty())
     {
@@ -159,9 +159,10 @@ static int sdpa_4d_blob_to_fp32(const Mat& src, Mat& dst, bool fp16, const Optio
             return -100;
     }
 
+    // each blob by its own storage type, fp16 first as elsewhere in the arm layers
     if (src_unpacked.elembits() == 16)
     {
-        if (fp16)
+        if (opt.use_fp16_storage)
             cast_float16_to_float32(src_unpacked, dst, opt);
 #if NCNN_BF16
         else
@@ -207,7 +208,7 @@ int SDPA_arm::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& to
         std::vector<Mat> bottom_blobs_fp32(bottom_blobs.size());
         for (size_t i = 0; i < bottom_blobs.size(); i++)
         {
-            int ret = sdpa_4d_blob_to_fp32(bottom_blobs[i], bottom_blobs_fp32[i], fp16, opt_ws);
+            int ret = sdpa_4d_blob_to_fp32(bottom_blobs[i], bottom_blobs_fp32[i], opt_ws);
             if (ret != 0)
                 return ret;
         }

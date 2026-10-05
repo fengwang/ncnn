@@ -102,6 +102,10 @@ int SDPA::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_bl
     if (int8_scale_term && bottom_blobs[0].dims == 4)
         return -1;
 
+    // kv cache has no 4-D (batched multi-head) path
+    if (kv_cache && bottom_blobs[0].dims == 4)
+        return -1;
+
 #if NCNN_INT8
     if (int8_scale_term)
     {
@@ -116,7 +120,7 @@ int SDPA::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_bl
     const Mat& past_key = kv_cache ? bottom_blobs[attn_mask ? 4 : 3] : Mat();
     const Mat& past_value = kv_cache ? bottom_blobs[attn_mask ? 5 : 4] : Mat();
 
-    if (query.dims == 4 && !kv_cache)
+    if (query.dims == 4)
     {
         const int embed_dim = query.w;
         const int src_seqlen = query.h;
