@@ -98,6 +98,10 @@ int SDPA::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_bl
         return -1;
 #endif // NCNN_BATCH
 
+    // int8 has no 4-D (batched multi-head) path
+    if (int8_scale_term && bottom_blobs[0].dims == 4)
+        return -1;
+
 #if NCNN_INT8
     if (int8_scale_term)
     {

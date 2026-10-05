@@ -156,6 +156,38 @@ int SDPA_x86::destroy_pipeline(const Option& _opt)
     return 0;
 }
 
+// unpack to elempack 1 and cast to fp32 for the naive 4-D reference path
+static int sdpa_4d_blob_to_fp32(const Mat& src, Mat& dst, const Option& opt)
+{
+    if (src.empty())
+    {
+        dst = src;
+        return 0;
+    }
+
+    Mat src_unpacked = src;
+    if (src.elempack != 1)
+    {
+        convert_packing(src, src_unpacked, 1, opt);
+        if (src_unpacked.empty())
+            return -100;
+    }
+
+#if NCNN_BF16
+    if (src_unpacked.elembits() == 16)
+    {
+        cast_bfloat16_to_float32(src_unpacked, dst, opt);
+        if (dst.empty())
+            return -100;
+
+        return 0;
+    }
+#endif // NCNN_BF16
+
+    dst = src_unpacked;
+    return 0;
+}
+
 int SDPA_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& _opt) const
 {
 #if NCNN_BATCH
@@ -172,7 +204,48 @@ int SDPA_x86::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& to
     const Mat& query = bottom_blobs[0];
     if (query.dims == 4)
     {
-        return SDPA::forward(bottom_blobs, top_blobs, opt);
+        // 4-D query (w=embed h=seqlen d=num_heads c=batch) runs the naive fp32 reference,
+        // the output goes back to the storage type the inputs came in
+        const bool cast_back = query.elembits() == 16;
+
+        Option opt_ws = opt;
+        opt_ws.blob_allocator = opt.workspace_allocator;
+
+        std::vector<Mat> bottom_blobs_fp32(bottom_blobs.size());
+        for (size_t i = 0; i < bottom_blobs.size(); i++)
+        {
+            int ret = sdpa_4d_blob_to_fp32(bottom_blobs[i], bottom_blobs_fp32[i], opt_ws);
+            if (ret != 0)
+                return ret;
+        }
+
+        Option opt_fp32 = cast_back ? opt_ws : opt;
+        opt_fp32.use_packing_layout = false;
+        opt_fp32.use_fp16_storage = false;
+        opt_fp32.use_fp16_arithmetic = false;
+        opt_fp32.use_bf16_storage = false;
+
+        if (!cast_back)
+            return SDPA::forward(bottom_blobs_fp32, top_blobs, opt_fp32);
+
+        std::vector<Mat> top_blobs_fp32(top_blobs.size());
+        int ret = SDPA::forward(bottom_blobs_fp32, top_blobs_fp32, opt_fp32);
+        if (ret != 0)
+            return ret;
+
+        for (size_t i = 0; i < top_blobs.size(); i++)
+        {
+            if (top_blobs_fp32[i].empty())
+                continue;
+
+#if NCNN_BF16
+            cast_float32_to_bfloat16(top_blobs_fp32[i], top_blobs[i], opt);
+#endif
+            if (top_blobs[i].empty())
+                return -100;
+        }
+
+        return 0;
     }
 
     const Mat& cur_key = bottom_blobs[1];
