@@ -2270,6 +2270,7 @@ int ModelWriter::save(const char* parampath, const char* binpath)
             fprintf_param_value(" 6=%e", scale)
             fprintf_param_value(" 7=%d", kv_cache)
             fprintf_param_value(" 18=%d", quantize_term)
+            fprintf_param_value(" 19=%d", window_batch1)
 
 #if NCNN_WEIGHT_QUANT
             const bool weight_block_quantize
