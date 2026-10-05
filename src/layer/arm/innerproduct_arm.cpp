@@ -143,6 +143,42 @@ int InnerProduct_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Optio
     }
 #endif
 
+    if (bottom_blob.dims == 3 && bottom_blob.w == weight_data_size / num_output)
+    {
+        // row-wise gemm over every (h, c) row, output (num_output, h, c)
+        const int num_input = weight_data_size / num_output;
+        const int h = bottom_blob.h;
+        const int channels = bottom_blob.c * bottom_blob.elempack;
+
+        Option opt_ws = opt;
+        opt_ws.blob_allocator = opt.workspace_allocator;
+
+        Mat bottom_blob_unpacked;
+        convert_packing(bottom_blob, bottom_blob_unpacked, 1, opt_ws);
+        if (bottom_blob_unpacked.empty())
+            return -100;
+
+        Mat bottom_blob_2d = bottom_blob_unpacked.reshape(num_input, h * channels, opt.workspace_allocator);
+        if (bottom_blob_2d.empty())
+            return -100;
+
+        Mat top_blob_2d;
+        int ret = forward(bottom_blob_2d, top_blob_2d, opt);
+        if (ret != 0)
+            return ret;
+
+        Mat top_blob_unpacked;
+        convert_packing(top_blob_2d, top_blob_unpacked, 1, opt);
+        if (top_blob_unpacked.empty())
+            return -100;
+
+        top_blob = top_blob_unpacked.reshape(num_output, h, channels, opt.blob_allocator);
+        if (top_blob.empty())
+            return -100;
+
+        return 0;
+    }
+
     int elembits = bottom_blob.elembits();
 
 #if NCNN_ARM82
