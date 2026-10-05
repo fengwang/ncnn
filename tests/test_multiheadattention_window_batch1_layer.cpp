@@ -5,7 +5,7 @@
 // window_batch1=1: q/k/v are 3-D (w=feature, h=seqlen, c=num_windows), every
 // channel is an independent 2-D attention, output is (qdim, src_seqlen, num_windows).
 // The optional attn_mask is 2-D (shared by all heads) or 3-D (c=num_heads) and is
-// shared by all windows. forward returns -1 for kv_cache != 0, int8_scale_term != 0
+// shared by all windows. forward returns -1 for kv_cache != 0, quantize_term (18) != 0 (int8 and weight-block quant)
 // and inconsistent shapes (q.c == k.c == v.c and k.h == v.h are required).
 
 #include "testutil.h"
@@ -306,6 +306,11 @@ static int test_window_layer_matrix()
             ret |= test_window_cross(12, 20, 9, 16, 4, 5, 7, windows[i], mask_type);
         }
     }
+    // src_seqlen=8: the per-window 2-D blobs get packed along h
+    ret |= test_window_self(16, 2, 8, 3, 2);
+    ret |= test_window_self(16, 2, 8, 4, 3);
+    ret |= test_window_cross(12, 20, 9, 16, 4, 8, 7, 3, 3);
+    ret |= test_window_cross(12, 20, 9, 16, 4, 8, 7, 8, 0);
     return ret;
 }
 
@@ -313,15 +318,14 @@ static int test_window_layer_matrix()
 
 // mode MODE_FP32: naive or cpu layer, fp32 options, CompareMat 0.001
 // mode MODE_BF16 / MODE_FP16 (cpu layer only, packing on): same code path, max abs diff <= 1e-5
-static int test_window_equivalence_one(bool cpu, int mode, bool self, int mask_type, int num_windows)
+static int test_window_equivalence_one(bool cpu, int mode, bool self, int mask_type, int num_windows, int src_seqlen = 5)
 {
     const int embed_dim = 16;
     const int num_heads = 4;
     const int qdim = self ? embed_dim : 12;
     const int kdim = self ? embed_dim : 20;
     const int vdim = self ? embed_dim : 9;
-    const int src_seqlen = 5;
-    const int dst_seqlen = self ? 5 : 7;
+    const int dst_seqlen = self ? src_seqlen : 7;
     const int attn_mask = mask_type ? 1 : 0;
     const char* tag = cpu ? "cpu" : "naive";
 
@@ -426,6 +430,7 @@ static int test_window_equivalence()
             ret |= test_window_equivalence_one(cpu != 0, MODE_FP32, self != 0, 2, 4);
             ret |= test_window_equivalence_one(cpu != 0, MODE_FP32, self != 0, 0, 8);
             ret |= test_window_equivalence_one(cpu != 0, MODE_FP32, self != 0, 3, 4);
+            ret |= test_window_equivalence_one(cpu != 0, MODE_FP32, self != 0, 2, 3, 8);
         }
     }
 
@@ -444,7 +449,14 @@ static int test_window_equivalence()
             {
                 ret |= test_window_equivalence_one(true, mode, self != 0, 0, windows[i]);
                 ret |= test_window_equivalence_one(true, mode, self != 0, 2, windows[i]);
+                ret |= test_window_equivalence_one(true, mode, self != 0, 3, windows[i]);
             }
+        }
+        // src_seqlen=8: the per-window 2-D output is packed along h
+        for (int self = 0; self < 2; self++)
+        {
+            ret |= test_window_equivalence_one(true, mode, self != 0, 0, 3, 8);
+            ret |= test_window_equivalence_one(true, mode, self != 0, 3, 4, 8);
         }
     }
 
@@ -453,20 +465,103 @@ static int test_window_equivalence()
 
 // ---- 3. negatives ----
 
+// load_param, load_model and create_pipeline must succeed; forward must return -1
 static int expect_reject(const char* what, bool cpu, const ncnn::ParamDict& pd, const std::vector<ncnn::Mat>& weights, const std::vector<ncnn::Mat>& bottoms, int top_count)
 {
+    const char* tag = cpu ? "cpu" : "naive";
     const int typeindex = ncnn::layer_to_index("MultiHeadAttention");
     ncnn::Layer* op = cpu ? ncnn::create_layer_cpu(typeindex) : ncnn::create_layer_naive(typeindex);
-    ncnn::Mat top;
-    int ret = run_layer(op, pd, weights, bottoms, top_count, top);
+    ncnn::Option opt = fp32_option();
+
+    int ret = op->load_param(pd);
+    if (ret != 0)
+    {
+        fprintf(stderr, "test_window_negative %s %s: load_param ret=%d, expect 0\n", tag, what, ret);
+        delete op;
+        return -1;
+    }
+
+    ncnn::ModelBinFromMatArray mb(weights.data());
+    ret = op->load_model(mb);
+    if (ret != 0)
+    {
+        fprintf(stderr, "test_window_negative %s %s: load_model ret=%d, expect 0\n", tag, what, ret);
+        delete op;
+        return -1;
+    }
+
+    ret = op->create_pipeline(opt);
+    if (ret != 0)
+    {
+        fprintf(stderr, "test_window_negative %s %s: create_pipeline ret=%d, expect 0\n", tag, what, ret);
+        delete op;
+        return -1;
+    }
+
+    std::vector<ncnn::Mat> tops(top_count);
+    ret = op->forward(bottoms, tops, opt);
+    op->destroy_pipeline(opt);
     delete op;
+
     if (ret != -1)
     {
-        fprintf(stderr, "test_window_negative %s %s: expect -1, got %d\n", cpu ? "cpu" : "naive", what, ret);
+        fprintf(stderr, "test_window_negative %s %s: forward expect -1, got %d\n", tag, what, ret);
         return -1;
     }
     return 0;
 }
+
+#if NCNN_INT8
+// int8 weights as in tests/test_multiheadattention_1.cpp (int8_scale_term=2)
+static void make_weights_int8(std::vector<ncnn::Mat>& weights, int embed_dim, int qdim, int kdim, int vdim)
+{
+    weights.resize(12);
+    weights[0] = RandomS8Mat(embed_dim * qdim);
+    weights[1] = RandomMat(embed_dim);
+    weights[2] = RandomS8Mat(embed_dim * kdim);
+    weights[3] = RandomMat(embed_dim);
+    weights[4] = RandomS8Mat(embed_dim * vdim);
+    weights[5] = RandomMat(embed_dim);
+    weights[6] = RandomS8Mat(qdim * embed_dim);
+    weights[7] = RandomMat(qdim);
+    weights[8] = RandomMat(embed_dim, 160.f, 200.f);
+    weights[9] = RandomMat(embed_dim, 160.f, 200.f);
+    weights[10] = RandomMat(embed_dim, 160.f, 200.f);
+    weights[11] = RandomMat(1, 160.f, 200.f);
+}
+#endif // NCNN_INT8
+
+#if NCNN_WEIGHT_QUANT
+// 8-bit weight-block quant weights as in tests/test_multiheadattention_oom.cpp
+// quantize_term = 800 + input_scale * 10 + block_size_code (32 -> 0, 64 -> 1)
+static int make_weights_wq_int8(std::vector<ncnn::Mat>& weights, int embed_dim, int qdim, int kdim, int vdim, int block_size, int input_scale)
+{
+    const int block_size_code = block_size == 32 ? 0 : block_size == 64 ? 1 : 2;
+
+    weights.resize(input_scale ? 16 : 12);
+    weights[0] = RandomS8Mat(qdim, embed_dim);
+    weights[1] = RandomMat(embed_dim);
+    weights[2] = RandomS8Mat(kdim, embed_dim);
+    weights[3] = RandomMat(embed_dim);
+    weights[4] = RandomS8Mat(vdim, embed_dim);
+    weights[5] = RandomMat(embed_dim);
+    weights[6] = RandomS8Mat(embed_dim, qdim);
+    weights[7] = RandomMat(qdim);
+    weights[8] = RandomMat((qdim + block_size - 1) / block_size, embed_dim, 10.f, 20.f);
+    weights[9] = RandomMat((kdim + block_size - 1) / block_size, embed_dim, 10.f, 20.f);
+    weights[10] = RandomMat((vdim + block_size - 1) / block_size, embed_dim, 10.f, 20.f);
+    weights[11] = RandomMat((embed_dim + block_size - 1) / block_size, qdim, 10.f, 20.f);
+    if (input_scale)
+    {
+        weights[12] = RandomMat(qdim, 0.5f, 1.5f);
+        weights[13] = RandomMat(kdim, 0.5f, 1.5f);
+        weights[14] = RandomMat(vdim, 0.5f, 1.5f);
+        weights[15] = RandomMat(embed_dim, 0.5f, 1.5f);
+    }
+
+    return 800 + input_scale * 10 + block_size_code;
+}
+#endif // NCNN_WEIGHT_QUANT
 
 static int test_window_negatives()
 {
@@ -535,22 +630,14 @@ static int test_window_negatives()
     }
 
 #if NCNN_INT8
-    // int8_scale_term (18) != 0: naive layer only. The weights stay fp32 and the
-    // int8 scale blobs are appended (q/k/v [embed_dim], out [1]); a cpu layer would
-    // convert int8 weights in create_pipeline, so it is not exercised here.
+    // int8_scale_term (18) = 2 with int8 weights: naive and cpu layer
     {
         ncnn::ParamDict pd;
         make_pd(pd, embed_dim, num_heads, embed_dim, embed_dim, embed_dim, 0, 1);
         pd.set(18, 2);
 
-        std::vector<ncnn::Mat> weights_int8 = weights;
-        weights_int8.push_back(RandomMat(embed_dim, 1.f, 10.f));
-        weights_int8.push_back(RandomMat(embed_dim, 1.f, 10.f));
-        weights_int8.push_back(RandomMat(embed_dim, 1.f, 10.f));
-        weights_int8.push_back(RandomMat(1, 1.f, 10.f));
-        // spare blobs so a loader that reads more entries stays in bounds
-        for (int i = 0; i < 8; i++)
-            weights_int8.push_back(RandomMat(embed_dim, 1.f, 10.f));
+        std::vector<ncnn::Mat> weights_int8;
+        make_weights_int8(weights_int8, embed_dim, embed_dim, embed_dim, embed_dim);
 
         std::vector<ncnn::Mat> bottoms(3);
         bottoms[0] = RandomMat(embed_dim, 5, 3);
@@ -558,8 +645,31 @@ static int test_window_negatives()
         bottoms[2] = RandomMat(embed_dim, 5, 3);
 
         ret |= expect_reject("int8_scale_term=2", false, pd, weights_int8, bottoms, 1);
+        ret |= expect_reject("int8_scale_term=2", true, pd, weights_int8, bottoms, 1);
     }
-#endif
+#endif // NCNN_INT8
+
+#if NCNN_WEIGHT_QUANT
+    // weight-block quant (18 = 8xx) with and without input scales: naive and cpu layer
+    for (int input_scale = 0; input_scale < 2; input_scale++)
+    {
+        std::vector<ncnn::Mat> weights_wq;
+        const int quantize_term = make_weights_wq_int8(weights_wq, embed_dim, embed_dim, embed_dim, embed_dim, 32, input_scale);
+
+        ncnn::ParamDict pd;
+        make_pd(pd, embed_dim, num_heads, embed_dim, embed_dim, embed_dim, 0, 1);
+        pd.set(18, quantize_term);
+
+        std::vector<ncnn::Mat> bottoms(3);
+        bottoms[0] = RandomMat(embed_dim, 5, 3);
+        bottoms[1] = RandomMat(embed_dim, 5, 3);
+        bottoms[2] = RandomMat(embed_dim, 5, 3);
+
+        const char* what = input_scale ? "weight-block quant 810" : "weight-block quant 800";
+        ret |= expect_reject(what, false, pd, weights_wq, bottoms, 1);
+        ret |= expect_reject(what, true, pd, weights_wq, bottoms, 1);
+    }
+#endif // NCNN_WEIGHT_QUANT
 
     return ret;
 }

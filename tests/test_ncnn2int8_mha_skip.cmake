@@ -3,7 +3,8 @@
 
 # Contract test: ncnn2int8 never quantizes MultiHeadAttention.
 # It prints "skip_quantize_multiheadattention <name>" to stderr, leaves
-# int8_scale_term at 0 (no " 18=" written) and ModelWriter keeps window_batch1 (" 19=1").
+# quantize_term at 0 (no " 18=" written); ModelWriter writes window_batch1 as " 19=1"
+# and writes no " 19=" for a layer whose window_batch1 is 0.
 #
 # usage: cmake -DNCNN2INT8=<path to ncnn2int8> -DWORK_DIR=<scratch dir> -P test_ncnn2int8_mha_skip.cmake
 
@@ -21,11 +22,14 @@ set(IN_PARAM "${WORK_DIR}/mha_window.param")
 set(OUT_PARAM "${WORK_DIR}/mha_window-int8.param")
 set(OUT_BIN "${WORK_DIR}/mha_window-int8.bin")
 
-# Input (16, 5, 3) -> MultiHeadAttention self-attention, embed_dim=16 num_heads=2 window_batch1=1
+# Input (16, 5, 3) -> mha0: MultiHeadAttention self-attention, embed_dim=16 num_heads=2 window_batch1=1
+# Input (16, 5)    -> mha1: plain 2-D MultiHeadAttention, window_batch1 left at its default 0
 file(WRITE "${IN_PARAM}" "7767517
-2 2
+4 4
 Input                    in0                      0 1 in0 0=16 1=5 2=3
 MultiHeadAttention       mha0                     1 1 in0 out0 0=16 1=2 2=256 3=16 4=16 19=1
+Input                    in1                      0 1 in1 0=16 1=5
+MultiHeadAttention       mha1                     1 1 in1 out1 0=16 1=2 2=256 3=16 4=16
 ")
 
 # no calibration table: the tool accepts 4 arguments
@@ -45,9 +49,12 @@ if(NOT "${result}" STREQUAL "0")
     list(APPEND failures "exit code ${result}, expected 0")
 endif()
 
-if(NOT err MATCHES "skip_quantize_multiheadattention mha0")
-    list(APPEND failures "stderr lacks 'skip_quantize_multiheadattention mha0'")
-endif()
+# anchored at end of line so a longer layer name does not match
+foreach(name mha0 mha1)
+    if(NOT err MATCHES "(^|\n)skip_quantize_multiheadattention ${name}(\r?\n|$)")
+        list(APPEND failures "stderr lacks the line 'skip_quantize_multiheadattention ${name}'")
+    endif()
+endforeach()
 
 if(NOT EXISTS "${OUT_PARAM}")
     list(APPEND failures "output param ${OUT_PARAM} not written")
@@ -57,14 +64,33 @@ else()
 
     file(STRINGS "${OUT_PARAM}" mha_lines REGEX "^MultiHeadAttention[ \t]")
     list(LENGTH mha_lines mha_count)
-    if(NOT mha_count EQUAL 1)
-        list(APPEND failures "expected 1 MultiHeadAttention line in output param, found ${mha_count}")
+    if(NOT mha_count EQUAL 2)
+        list(APPEND failures "expected 2 MultiHeadAttention lines in output param, found ${mha_count}")
+    endif()
+
+    file(STRINGS "${OUT_PARAM}" mha0_line REGEX "^MultiHeadAttention[ \t]+mha0[ \t]")
+    file(STRINGS "${OUT_PARAM}" mha1_line REGEX "^MultiHeadAttention[ \t]+mha1[ \t]")
+
+    if(NOT mha0_line)
+        list(APPEND failures "no MultiHeadAttention mha0 line in output param")
     else()
-        if(mha_lines MATCHES " 18=")
-            list(APPEND failures "MultiHeadAttention line has a 18= (int8_scale_term) entry: ${mha_lines}")
+        if(mha0_line MATCHES " 18=")
+            list(APPEND failures "mha0 line has a 18= (quantize_term) entry: ${mha0_line}")
         endif()
-        if(NOT mha_lines MATCHES " 19=1( |$)")
-            list(APPEND failures "MultiHeadAttention line lacks 19=1 (window_batch1): ${mha_lines}")
+        if(NOT mha0_line MATCHES " 19=1( |$)")
+            list(APPEND failures "mha0 line lacks 19=1 (window_batch1): ${mha0_line}")
+        endif()
+    endif()
+
+    # ModelWriter writes 19= only when window_batch1 is non-zero
+    if(NOT mha1_line)
+        list(APPEND failures "no MultiHeadAttention mha1 line in output param")
+    else()
+        if(mha1_line MATCHES " 18=")
+            list(APPEND failures "mha1 line has a 18= (quantize_term) entry: ${mha1_line}")
+        endif()
+        if(mha1_line MATCHES " 19=")
+            list(APPEND failures "mha1 line (window_batch1=0) has a 19= entry: ${mha1_line}")
         endif()
     endif()
 endif()
